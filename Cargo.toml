@@ -10,3 +10,4 @@ image = "0.25.10"
 rayon = "1.10"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.32", features = ["full"] }
+phf = { version = "0.11", features = ["macros"] }
