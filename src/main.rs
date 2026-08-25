@@ -341,8 +341,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    color_img.save("world_color_map.png")?;
-    height_img.save("world_height_map.png")?;
+    println!("Slicing map into 256x256 web tiles...");
+    let tile_size = 256;
+    let tiles_x = (total_width as f32 / tile_size as f32).ceil() as u32;
+    let tiles_z = (total_height as f32 / tile_size as f32).ceil() as u32;
+
+    // We will save these under tiles/0/ (where 0 is our base zoom level)
+    let base_out_dir = Path::new("tiles").join("0");
+
+    // 1. Pre-create the X-coordinate directory structure so our parallel threads don't trip over each other
+    for tx in 0..tiles_x {
+        std::fs::create_dir_all(base_out_dir.join(tx.to_string()))?;
+    }
+
+    // 2. Create a flat list of all the tile coordinates we need to generate
+    let mut tile_coords = Vec::new();
+    for tz in 0..tiles_z {
+        for tx in 0..tiles_x {
+            tile_coords.push((tx, tz));
+        }
+    }
+
+    // 3. Process and save all tiles in parallel using Rayon!
+    tile_coords.par_iter().for_each(|&(tx, tz)| {
+        let mut tile = RgbImage::new(tile_size, tile_size);
+        let start_x = tx * tile_size;
+        let start_z = tz * tile_size;
+
+        let mut is_empty = true; // Optimization flag
+
+        for z in 0..tile_size {
+            for x in 0..tile_size {
+                let global_x = start_x + x;
+                let global_z = start_z + z;
+
+                // Ensure we don't read out of bounds of our global map
+                if global_x < total_width as u32 && global_z < total_height as u32 {
+                    let pixel = color_img.get_pixel(global_x, global_z);
+                    tile.put_pixel(x, z, *pixel);
+
+                    // If the pixel isn't our dark background color, the tile isn't empty
+                    if pixel.0 != [30, 30, 30] {
+                        is_empty = false;
+                    }
+                } else {
+                    // Out of bounds (edges of the map) get the background color
+                    tile.put_pixel(x, z, Rgb([30, 30, 30]));
+                }
+            }
+        }
+
+        // 4. Only save the tile to disk if it actually contains map data
+        if !is_empty {
+            // Saves in standard web map format: tiles/zoom/x/z.png
+            let tile_path = base_out_dir
+                .join(tx.to_string())
+                .join(format!("{}.png", tz));
+            tile.save(tile_path).unwrap();
+        }
+    });
+
+    println!("Finished generating web tiles!");
 
     let elapsed = start_time.elapsed();
     println!("Execution finished in {:.2?}", elapsed);
@@ -383,4 +442,3 @@ fn get_block_at<'a>(section: &'a ChunkSection, x: usize, y: usize, z: usize) -> 
         .map(|b| b.name.as_str())
         .unwrap_or("minecraft:air")
 }
-
