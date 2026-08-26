@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dynamic Minecraft Mapping Tool</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body,
+    html {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background-color: #1e1e1e;
+    }
+
+    #map {
+      height: 100vh;
+      width: 100vw;
+      background-color: #1e1e1e;
+    }
+
+    .leaflet-tile {
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const commonLayerOptions = {
+      tileSize: 256,
+      noWrap: true,
+      minZoom: -2,
+      maxZoom: 2,
+      minNativeZoom: 0,
+      maxNativeZoom: 0,
+      errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII='
+    };
+
+    const colorMap = L.tileLayer('/tiles/0/{x}/{y}.png', commonLayerOptions);
+    const heightMap = L.tileLayer('/tiles_height/0/{x}/{y}.png', commonLayerOptions);
+
+    const map = L.map('map', {
+      crs: L.CRS.Simple,
+      minZoom: -2,
+      maxZoom: 2,
+      layers: [colorMap],
+      fadeAnimation: false,     // Disables stuttery tile fade-ins
+      zoomAnimation: false,     // Disables smooth zoom lag on custom grids
+      markerZoomAnimation: false
+    });
+
+    L.control.layers({
+      "Color Map": colorMap,
+      "Height Map": heightMap
+    }).addTo(map);
+
+    map.setView([-1000, 1000], -1);
+  </script>
+</body>
+
+</html>

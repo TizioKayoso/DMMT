@@ -1,3 +1,7 @@
+use axum::{
+    Router,
+    http::{HeaderValue, header::CACHE_CONTROL},
+};
 use flate2::read::ZlibDecoder;
 use image::{Rgb, RgbImage};
 use rayon::prelude::*;
@@ -6,6 +10,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tokio::net::TcpListener;
+use tower_http::{
+    compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
+};
 
 mod block_to_rgb;
 use crate::block_to_rgb::block_to_rgb;
@@ -59,32 +67,32 @@ fn depth_to_water_color(depth: i16) -> [u8; 3] {
 }
 
 fn relative_height_to_color(diff: i16, max_diff: i16) -> [u8; 3] {
-    if diff <= 5 {
-        return [34, 168, 76];
-    }
+    let range = max_diff.max(1) as f32;
+    let t = (diff as f32 / range).clamp(0.0, 1.0);
 
-    let band_size = 5;
-    let banded_diff = 5 + ((diff - 5) / band_size) * band_size;
-    let range = (max_diff - 5).max(1) as f32;
-    let t = ((banded_diff - 5) as f32 / range).clamp(0.0, 1.0);
-
-    if t < 0.33 {
-        let factor = t / 0.33;
-        let r = (34.0 + factor * (212.0 - 34.0)) as u8;
-        let g = (168.0 + factor * (201.0 - 168.0)) as u8;
-        let b = (76.0 + factor * (116.0 - 76.0)) as u8;
+    // Keeps your lush green and mountain palette, but blends the
+    // absolute lowest border pixels into a dark neutral tone
+    // so the green outline disappears.
+    if t < 0.1 {
+        // Fade from map background (30,30,30) to dark earth
+        let f = t / 0.1;
+        let r = (30.0 + f * (50.0 - 30.0)) as u8;
+        let g = (30.0 + f * (70.0 - 30.0)) as u8;
+        let b = (30.0 + f * (40.0 - 30.0)) as u8;
         [r, g, b]
-    } else if t < 0.66 {
-        let factor = (t - 0.33) / 0.33;
-        let r = (212.0 + factor * (143.0 - 212.0)) as u8;
-        let g = (201.0 + factor * (89.0 - 201.0)) as u8;
-        let b = (116.0 + factor * (43.0 - 116.0)) as u8;
+    } else if t < 0.5 {
+        // Transition into your natural green mid-tones
+        let f = (t - 0.1) / 0.4;
+        let r = (50.0 + f * (90.0 - 50.0)) as u8;
+        let g = (70.0 + f * (140.0 - 70.0)) as u8;
+        let b = (40.0 + f * (60.0 - 40.0)) as u8;
         [r, g, b]
     } else {
-        let factor = (t - 0.66) / 0.34;
-        let r = (143.0 + factor * (245.0 - 143.0)) as u8;
-        let g = (89.0 + factor * (245.0 - 89.0)) as u8;
-        let b = (43.0 + factor * (245.0 - 43.0)) as u8;
+        // Transition up to high mountain peaks
+        let f = (t - 0.5) / 0.5;
+        let r = (90.0 + f * (220.0 - 90.0)) as u8;
+        let g = (140.0 + f * (220.0 - 140.0)) as u8;
+        let b = (60.0 + f * (220.0 - 60.0)) as u8;
         [r, g, b]
     }
 }
@@ -234,7 +242,8 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
     chunks
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
     let mut region_files = Vec::new();
@@ -263,7 +272,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_height
     );
 
-    // Process all regions in parallel using Rayon work-stealing thread pool
     let processed_chunks: Vec<ProcessedChunk> = region_files
         .into_par_iter()
         .flat_map(|(rx, rz, path)| process_region(rx, rz, &path))
@@ -272,9 +280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut color_img =
         RgbImage::from_pixel(total_width as u32, total_height as u32, Rgb([30, 30, 30]));
 
-    // Flat 1D vectors for cache locality instead of Vec<Vec<T>>
     let mut world_y_grid = vec![-64i16; total_width * total_height];
     let mut water_depth_grid = vec![0i16; total_width * total_height];
+    let mut valid_grid = vec![false; total_width * total_height];
 
     for chunk in processed_chunks {
         let reg_offset_x = ((chunk.reg_x - min_rx) as usize) * 512;
@@ -288,56 +296,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 world_y_grid[idx] = chunk.world_heights[z][x];
                 water_depth_grid[idx] = chunk.water_depths[z][x];
+                valid_grid[idx] = true;
 
                 color_img.put_pixel(global_x as u32, global_z as u32, Rgb(chunk.colors[z][x]));
             }
         }
     }
 
-    let mut min_land_y = i16::MAX;
-    let mut max_land_y = i16::MIN;
-
-    for z in 0..total_height {
-        let row_offset = z * total_width;
-        for x in 0..total_width {
-            let idx = row_offset + x;
-            if water_depth_grid[idx] == 0 {
-                let y = world_y_grid[idx];
-                if y < min_land_y {
-                    min_land_y = y;
+    // Parallelized min/max land height calculation
+    let (min_land_y, max_land_y) = (0..total_height)
+        .into_par_iter()
+        .fold(
+            || (i16::MAX, i16::MIN),
+            |(mut min_y, mut max_y), z| {
+                let row_offset = z * total_width;
+                for x in 0..total_width {
+                    let idx = row_offset + x;
+                    if valid_grid[idx] && water_depth_grid[idx] == 0 {
+                        let y = world_y_grid[idx];
+                        if y < min_y {
+                            min_y = y;
+                        }
+                        if y > max_y {
+                            max_y = y;
+                        }
+                    }
                 }
-                if y > max_land_y {
-                    max_land_y = y;
-                }
-            }
-        }
-    }
+                (min_y, max_y)
+            },
+        )
+        .reduce(
+            || (i16::MAX, i16::MIN),
+            |(min_a, max_a), (min_b, max_b)| (min_a.min(min_b), max_a.max(max_b)),
+        );
 
-    if min_land_y == i16::MAX {
-        min_land_y = -64;
-    }
-    if max_land_y == i16::MIN {
-        max_land_y = 320;
-    }
-
+    let min_land_y = if min_land_y == i16::MAX {
+        -64
+    } else {
+        min_land_y
+    };
+    let max_land_y = if max_land_y == i16::MIN {
+        320
+    } else {
+        max_land_y
+    };
     let max_diff = (max_land_y - min_land_y).max(1);
-    let mut height_img =
-        RgbImage::from_pixel(total_width as u32, total_height as u32, Rgb([34, 168, 76]));
 
-    for z in 0..total_height {
-        let row_offset = z * total_width;
-        for x in 0..total_width {
-            let idx = row_offset + x;
-            let depth = water_depth_grid[idx];
-            if depth > 0 {
-                let blue_rgb = depth_to_water_color(depth);
-                height_img.put_pixel(x as u32, z as u32, Rgb(blue_rgb));
-            } else {
-                let current_y = world_y_grid[idx];
-                let diff_from_lowest = (current_y - min_land_y).max(0);
-                let land_rgb = relative_height_to_color(diff_from_lowest, max_diff);
-                height_img.put_pixel(x as u32, z as u32, Rgb(land_rgb));
+    let mut height_img =
+        RgbImage::from_pixel(total_width as u32, total_height as u32, Rgb([30, 30, 30]));
+
+    // Parallelized height map row generation using Rayon
+    let height_pixels: Vec<Vec<[u8; 3]>> = (0..total_height)
+        .into_par_iter()
+        .map(|z| {
+            let row_offset = z * total_width;
+            let mut row_colors = vec![[30, 30, 30]; total_width];
+            for x in 0..total_width {
+                let idx = row_offset + x;
+                if valid_grid[idx] {
+                    let depth = water_depth_grid[idx];
+                    if depth > 0 {
+                        row_colors[x] = depth_to_water_color(depth);
+                    } else {
+                        let current_y = world_y_grid[idx];
+                        let diff_from_lowest = (current_y - min_land_y).max(0);
+                        row_colors[x] = relative_height_to_color(diff_from_lowest, max_diff);
+                    }
+                }
             }
+            row_colors
+        })
+        .collect();
+
+    for (z, row) in height_pixels.into_iter().enumerate() {
+        for (x, color) in row.into_iter().enumerate() {
+            height_img.put_pixel(x as u32, z as u32, Rgb(color));
         }
     }
 
@@ -346,15 +379,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tiles_x = (total_width as f32 / tile_size as f32).ceil() as u32;
     let tiles_z = (total_height as f32 / tile_size as f32).ceil() as u32;
 
-    // We will save these under tiles/0/ (where 0 is our base zoom level)
     let base_out_dir = Path::new("tiles").join("0");
 
-    // 1. Pre-create the X-coordinate directory structure so our parallel threads don't trip over each other
     for tx in 0..tiles_x {
         std::fs::create_dir_all(base_out_dir.join(tx.to_string()))?;
     }
 
-    // 2. Create a flat list of all the tile coordinates we need to generate
     let mut tile_coords = Vec::new();
     for tz in 0..tiles_z {
         for tx in 0..tiles_x {
@@ -362,38 +392,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. Process and save all tiles in parallel using Rayon!
     tile_coords.par_iter().for_each(|&(tx, tz)| {
         let mut tile = RgbImage::new(tile_size, tile_size);
         let start_x = tx * tile_size;
         let start_z = tz * tile_size;
 
-        let mut is_empty = true; // Optimization flag
+        let mut is_empty = true;
 
         for z in 0..tile_size {
             for x in 0..tile_size {
                 let global_x = start_x + x;
                 let global_z = start_z + z;
 
-                // Ensure we don't read out of bounds of our global map
                 if global_x < total_width as u32 && global_z < total_height as u32 {
                     let pixel = color_img.get_pixel(global_x, global_z);
                     tile.put_pixel(x, z, *pixel);
 
-                    // If the pixel isn't our dark background color, the tile isn't empty
                     if pixel.0 != [30, 30, 30] {
                         is_empty = false;
                     }
                 } else {
-                    // Out of bounds (edges of the map) get the background color
                     tile.put_pixel(x, z, Rgb([30, 30, 30]));
                 }
             }
         }
 
-        // 4. Only save the tile to disk if it actually contains map data
         if !is_empty {
-            // Saves in standard web map format: tiles/zoom/x/z.png
             let tile_path = base_out_dir
                 .join(tx.to_string())
                 .join(format!("{}.png", tz));
@@ -403,9 +427,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Finished generating web tiles!");
 
+    println!("Slicing height map into web tiles...");
+    let height_out_dir = Path::new("tiles_height").join("0");
+    for tx in 0..tiles_x {
+        std::fs::create_dir_all(height_out_dir.join(tx.to_string()))?;
+    }
+
+    tile_coords.par_iter().for_each(|&(tx, tz)| {
+        let mut tile = RgbImage::new(tile_size, tile_size);
+        let start_x = tx * tile_size;
+        let start_z = tz * tile_size;
+        let mut is_empty = true;
+
+        for z in 0..tile_size {
+            for x in 0..tile_size {
+                let global_x = start_x + x;
+                let global_z = start_z + z;
+
+                if global_x < total_width as u32 && global_z < total_height as u32 {
+                    let pixel = height_img.get_pixel(global_x, global_z);
+                    tile.put_pixel(x, z, *pixel);
+                    if pixel.0 != [30, 30, 30] {
+                        is_empty = false;
+                    }
+                } else {
+                    tile.put_pixel(x, z, Rgb([30, 30, 30]));
+                }
+            }
+        }
+
+        if !is_empty {
+            let tile_path = height_out_dir
+                .join(tx.to_string())
+                .join(format!("{}.png", tz));
+            tile.save(tile_path).unwrap();
+        }
+    });
+
+    println!("Finished generating height map tiles!");
+
     let elapsed = start_time.elapsed();
     println!("Execution finished in {:.2?}", elapsed);
+    println!("Starting web server on http://localhost:8080");
 
+    let app = Router::new()
+        .nest_service("/tiles", ServeDir::new("tiles"))
+        .nest_service("/tiles_height", ServeDir::new("tiles_height"))
+        .fallback_service(ServeDir::new("public"))
+        .layer(CompressionLayer::new())
+        .layer(SetResponseHeaderLayer::if_not_present(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=604800"),
+        ));
+
+    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

@@ -10,3 +10,6 @@ image = "0.25.10"
 rayon = "1.10"
 serde = { version = "1.0.229", features = ["derive"] }
 phf = { version = "0.11", features = ["macros"] }
+tokio = { version = "1.0", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "compression-gzip", "set-header"] }
