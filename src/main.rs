@@ -70,25 +70,19 @@ fn relative_height_to_color(diff: i16, max_diff: i16) -> [u8; 3] {
     let range = max_diff.max(1) as f32;
     let t = (diff as f32 / range).clamp(0.0, 1.0);
 
-    // Keeps your lush green and mountain palette, but blends the
-    // absolute lowest border pixels into a dark neutral tone
-    // so the green outline disappears.
     if t < 0.1 {
-        // Fade from map background (30,30,30) to dark earth
         let f = t / 0.1;
         let r = (30.0 + f * (50.0 - 30.0)) as u8;
         let g = (30.0 + f * (70.0 - 30.0)) as u8;
         let b = (30.0 + f * (40.0 - 30.0)) as u8;
         [r, g, b]
     } else if t < 0.5 {
-        // Transition into your natural green mid-tones
         let f = (t - 0.1) / 0.4;
         let r = (50.0 + f * (90.0 - 50.0)) as u8;
         let g = (70.0 + f * (140.0 - 70.0)) as u8;
         let b = (40.0 + f * (60.0 - 40.0)) as u8;
         [r, g, b]
     } else {
-        // Transition up to high mountain peaks
         let f = (t - 0.5) / 0.5;
         let r = (90.0 + f * (220.0 - 90.0)) as u8;
         let g = (140.0 + f * (220.0 - 140.0)) as u8;
@@ -242,6 +236,78 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
     chunks
 }
 
+fn generate_tile_pyramid(
+    img: &RgbImage,
+    base_folder: &str,
+    max_zoom_out: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tile_size = 256u32;
+
+    for zoom in (max_zoom_out..=0).rev() {
+        let scale_factor = 1 << (-zoom as u32);
+        let target_w = (img.width() / scale_factor).max(1);
+        let target_h = (img.height() / scale_factor).max(1);
+
+        let resized_img = if zoom == 0 {
+            img.clone()
+        } else {
+            image::imageops::resize(
+                img,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Nearest,
+            )
+        };
+
+        let tiles_x = (target_w as f32 / tile_size as f32).ceil() as u32;
+        let tiles_z = (target_h as f32 / tile_size as f32).ceil() as u32;
+
+        let zoom_out_dir = Path::new(base_folder).join(zoom.to_string());
+        for tx in 0..tiles_x {
+            std::fs::create_dir_all(zoom_out_dir.join(tx.to_string()))?;
+        }
+
+        let mut tile_coords = Vec::new();
+        for tz in 0..tiles_z {
+            for tx in 0..tiles_x {
+                tile_coords.push((tx, tz));
+            }
+        }
+
+        tile_coords.par_iter().for_each(|&(tx, tz)| {
+            let mut tile = RgbImage::new(tile_size, tile_size);
+            let start_x = tx * tile_size;
+            let start_z = tz * tile_size;
+            let mut is_empty = true;
+
+            for z in 0..tile_size {
+                for x in 0..tile_size {
+                    let global_x = start_x + x;
+                    let global_z = start_z + z;
+
+                    if global_x < target_w && global_z < target_h {
+                        let pixel = resized_img.get_pixel(global_x, global_z);
+                        tile.put_pixel(x, z, *pixel);
+                        if pixel.0 != [30, 30, 30] {
+                            is_empty = false;
+                        }
+                    } else {
+                        tile.put_pixel(x, z, Rgb([30, 30, 30]));
+                    }
+                }
+            }
+
+            if !is_empty {
+                let tile_path = zoom_out_dir
+                    .join(tx.to_string())
+                    .join(format!("{}.png", tz));
+                tile.save(tile_path).unwrap();
+            }
+        });
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
@@ -303,7 +369,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Parallelized min/max land height calculation
     let (min_land_y, max_land_y) = (0..total_height)
         .into_par_iter()
         .fold(
@@ -345,7 +410,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut height_img =
         RgbImage::from_pixel(total_width as u32, total_height as u32, Rgb([30, 30, 30]));
 
-    // Parallelized height map row generation using Rayon
     let height_pixels: Vec<Vec<[u8; 3]>> = (0..total_height)
         .into_par_iter()
         .map(|z| {
@@ -374,97 +438,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Slicing map into 256x256 web tiles...");
-    let tile_size = 256;
-    let tiles_x = (total_width as f32 / tile_size as f32).ceil() as u32;
-    let tiles_z = (total_height as f32 / tile_size as f32).ceil() as u32;
+    println!("Generating multi-resolution tile pyramid for Color Map...");
+    generate_tile_pyramid(&color_img, "tiles", -3)?;
 
-    let base_out_dir = Path::new("tiles").join("0");
+    println!("Generating multi-resolution tile pyramid for Height Map...");
+    generate_tile_pyramid(&height_img, "tiles_height", -3)?;
 
-    for tx in 0..tiles_x {
-        std::fs::create_dir_all(base_out_dir.join(tx.to_string()))?;
-    }
-
-    let mut tile_coords = Vec::new();
-    for tz in 0..tiles_z {
-        for tx in 0..tiles_x {
-            tile_coords.push((tx, tz));
-        }
-    }
-
-    tile_coords.par_iter().for_each(|&(tx, tz)| {
-        let mut tile = RgbImage::new(tile_size, tile_size);
-        let start_x = tx * tile_size;
-        let start_z = tz * tile_size;
-
-        let mut is_empty = true;
-
-        for z in 0..tile_size {
-            for x in 0..tile_size {
-                let global_x = start_x + x;
-                let global_z = start_z + z;
-
-                if global_x < total_width as u32 && global_z < total_height as u32 {
-                    let pixel = color_img.get_pixel(global_x, global_z);
-                    tile.put_pixel(x, z, *pixel);
-
-                    if pixel.0 != [30, 30, 30] {
-                        is_empty = false;
-                    }
-                } else {
-                    tile.put_pixel(x, z, Rgb([30, 30, 30]));
-                }
-            }
-        }
-
-        if !is_empty {
-            let tile_path = base_out_dir
-                .join(tx.to_string())
-                .join(format!("{}.png", tz));
-            tile.save(tile_path).unwrap();
-        }
-    });
-
-    println!("Finished generating web tiles!");
-
-    println!("Slicing height map into web tiles...");
-    let height_out_dir = Path::new("tiles_height").join("0");
-    for tx in 0..tiles_x {
-        std::fs::create_dir_all(height_out_dir.join(tx.to_string()))?;
-    }
-
-    tile_coords.par_iter().for_each(|&(tx, tz)| {
-        let mut tile = RgbImage::new(tile_size, tile_size);
-        let start_x = tx * tile_size;
-        let start_z = tz * tile_size;
-        let mut is_empty = true;
-
-        for z in 0..tile_size {
-            for x in 0..tile_size {
-                let global_x = start_x + x;
-                let global_z = start_z + z;
-
-                if global_x < total_width as u32 && global_z < total_height as u32 {
-                    let pixel = height_img.get_pixel(global_x, global_z);
-                    tile.put_pixel(x, z, *pixel);
-                    if pixel.0 != [30, 30, 30] {
-                        is_empty = false;
-                    }
-                } else {
-                    tile.put_pixel(x, z, Rgb([30, 30, 30]));
-                }
-            }
-        }
-
-        if !is_empty {
-            let tile_path = height_out_dir
-                .join(tx.to_string())
-                .join(format!("{}.png", tz));
-            tile.save(tile_path).unwrap();
-        }
-    });
-
-    println!("Finished generating height map tiles!");
+    println!("Finished generating all map tiles!");
 
     let elapsed = start_time.elapsed();
     println!("Execution finished in {:.2?}", elapsed);
