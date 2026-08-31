@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower_http::{
     compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
@@ -147,7 +147,12 @@ fn get_block_at(section: &ParsedSection, x: usize, y: usize, z: usize) -> Block 
         .unwrap_or(Block::Air)
 }
 
-fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChunk> {
+fn process_region(
+    rx_coord: i32,
+    rz_coord: i32,
+    path: &Path,
+    is_nether: bool,
+) -> Vec<ProcessedChunk> {
     let mut chunks = Vec::new();
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -237,11 +242,16 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
 
                                 'column: for section in &parsed_sections {
                                     for y_rel in (0..16).rev() {
+                                        // Calculate the real Y coordinate first
+                                        let world_y = (section.y as i16 * 16) + y_rel as i16;
+                                        // If we are in the Nether, slice off the roof (everything above Y=85)
+                                        if is_nether && world_y > 85 {
+                                            continue;
+                                        }
+
                                         let block = get_block_at(section, x, y_rel, z);
                                         if block != Block::Air {
                                             if top_y.is_none() {
-                                                let world_y =
-                                                    (section.y as i16 * 16) + y_rel as i16;
                                                 top_y = Some(world_y);
                                                 colors[z][x] = block_to_rgb(block);
                                                 if block == Block::Water
@@ -265,7 +275,6 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
                                         }
                                     }
                                 }
-
                                 if let Some(y) = top_y {
                                     world_heights[z][x] = y;
                                     water_depths[z][x] = if is_water { depth.max(1) } else { 0 };
@@ -292,9 +301,9 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
 
 fn generate_tile_pyramid(
     img: &RgbImage,
-    base_folder: &str,
+    base_folder: &Path,
     max_zoom_out: i32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tile_size = 256u32;
 
     for zoom in (max_zoom_out..=0).rev() {
@@ -316,7 +325,7 @@ fn generate_tile_pyramid(
         let tiles_x = (target_w as f32 / tile_size as f32).ceil() as u32;
         let tiles_z = (target_h as f32 / tile_size as f32).ceil() as u32;
 
-        let zoom_out_dir = Path::new(base_folder).join(zoom.to_string());
+        let zoom_out_dir = base_folder.join(zoom.to_string());
         for tx in 0..tiles_x {
             std::fs::create_dir_all(zoom_out_dir.join(tx.to_string()))?;
         }
@@ -362,44 +371,35 @@ fn generate_tile_pyramid(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn process_dimension(
+    dim_name: &str,
+    dim_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
-
     let mut region_files = Vec::new();
-    find_mca_files(Path::new("."), &mut region_files);
 
+    find_mca_files(dim_dir, &mut region_files);
     if region_files.is_empty() {
-        println!("Nessun file region (.mca) trovato nelle sottocartelle!");
         return Ok(());
     }
+
+    println!("Processing dimension: '{}'", dim_name);
 
     let min_rx = region_files.iter().map(|&(x, _, _)| x).min().unwrap();
     let max_rx = region_files.iter().map(|&(x, _, _)| x).max().unwrap();
     let min_rz = region_files.iter().map(|&(_, z, _)| z).min().unwrap();
     let max_rz = region_files.iter().map(|&(_, z, _)| z).max().unwrap();
 
-    let regions_width = (max_rx - min_rx + 1) as usize;
-    let regions_height = (max_rz - min_rz + 1) as usize;
-
-    let total_width = regions_width * 512;
-    let total_height = regions_height * 512;
-
-    println!(
-        "Trovati {} file region. Mappa globale dimensionata a {}x{} blocchi.",
-        region_files.len(),
-        total_width,
-        total_height
-    );
-
+    let total_width = ((max_rx - min_rx + 1) as usize) * 512;
+    let total_height = ((max_rz - min_rz + 1) as usize) * 512;
+    let is_nether = dim_name == "the_nether";
     let processed_chunks: Vec<ProcessedChunk> = region_files
         .into_par_iter()
-        .flat_map(|(rx, rz, path)| process_region(rx, rz, &path))
+        .flat_map(|(rx, rz, path)| process_region(rx, rz, &path, is_nether))
         .collect();
 
     let mut color_img =
         RgbImage::from_pixel(total_width as u32, total_height as u32, Rgb([30, 30, 30]));
-
     let mut world_y_grid = vec![-64i16; total_width * total_height];
     let mut water_depth_grid = vec![0i16; total_width * total_height];
     let mut valid_grid = vec![false; total_width * total_height];
@@ -417,7 +417,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 world_y_grid[idx] = chunk.world_heights[z][x];
                 water_depth_grid[idx] = chunk.water_depths[z][x];
                 valid_grid[idx] = true;
-
                 color_img.put_pixel(global_x as u32, global_z as u32, Rgb(chunk.colors[z][x]));
             }
         }
@@ -492,17 +491,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Generating multi-resolution tile pyramid for Color Map...");
-    generate_tile_pyramid(&color_img, "tiles", -3)?;
+    let color_out = Path::new("tiles").join(dim_name);
+    let height_out = Path::new("tiles_height").join(dim_name);
 
-    println!("Generating multi-resolution tile pyramid for Height Map...");
-    generate_tile_pyramid(&height_img, "tiles_height", -3)?;
+    generate_tile_pyramid(&color_img, &color_out, -3)?;
+    generate_tile_pyramid(&height_img, &height_out, -3)?;
 
-    println!("Finished generating all map tiles!");
+    println!("Finished '{}' in {:.2?}", dim_name, start_time.elapsed());
+    Ok(())
+}
 
-    let elapsed = start_time.elapsed();
-    println!("Execution finished in {:.2?}", elapsed);
-    println!("Starting web server on http://localhost:8080");
+fn run_generator() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let base_dir = if Path::new("minecraft").exists() {
+        Path::new("minecraft")
+    } else if Path::new("region").exists() {
+        Path::new("region")
+    } else {
+        println!("Waiting for world directory ('minecraft' or 'region') to be mounted...");
+        return Ok(());
+    };
+
+    if let Ok(entries) = std::fs::read_dir(base_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dim_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if dim_name == "creative_world" || dim_name.starts_with('.') {
+                        continue;
+                    }
+                    if let Err(e) = process_dimension(dim_name, &path) {
+                        eprintln!("Error processing dimension '{}': {}", dim_name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::spawn(async move {
+        loop {
+            println!("Starting map generation cycle...");
+            if let Err(e) = run_generator() {
+                eprintln!("Error during map generation: {}", e);
+            }
+            println!("Sleeping for 30 minutes...");
+            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        }
+    });
 
     let app = Router::new()
         .nest_service("/tiles", ServeDir::new("tiles"))
@@ -514,6 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HeaderValue::from_static("public, max-age=604800"),
         ));
 
+    println!("Starting web server on http://localhost:8080");
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
     Ok(())
