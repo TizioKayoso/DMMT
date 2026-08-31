@@ -1,3 +1,4 @@
+#example DockerFile for deployment
 FROM rust:slim AS builder
 WORKDIR /usr/src/app
 COPY . .
