@@ -2,6 +2,7 @@ use phf::phf_map;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+//Should i use JSON? yes. will i? no.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Block {
     Air,
@@ -882,8 +883,7 @@ pub fn parse_block_name(name: &str) -> Block {
 /// Ultra-fast color lookup using the pre-parsed `Block` enum.
 /// Safe to call millions of times inside tight rendering or voxel loops.
 #[inline(always)]
-pub fn block_to_rgb(name: &str) -> [u8; 3] {
-    let block = parse_block_name(name);
+pub fn block_to_rgb(block: Block) -> [u8; 3] {
     match block {
         Block::Air => [0, 0, 0],
         Block::GrassBlock => [89, 125, 39],
@@ -1166,4 +1166,3 @@ pub fn block_to_rgb(name: &str) -> [u8; 3] {
         Block::Unknown => [255, 0, 255],
     }
 }
-

@@ -16,7 +16,7 @@ use tower_http::{
 };
 
 mod block_to_rgb;
-use crate::block_to_rgb::block_to_rgb;
+use crate::block_to_rgb::{Block, block_to_rgb, parse_block_name};
 
 struct ProcessedChunk {
     reg_x: i32,
@@ -52,6 +52,12 @@ struct Blockstates {
 struct BlockState {
     #[serde(rename = "Name")]
     name: String,
+}
+
+struct ParsedSection<'a> {
+    y: i8,
+    palette: Vec<Block>,
+    data: Option<&'a fastnbt::LongArray>,
 }
 
 fn depth_to_water_color(depth: i16) -> [u8; 3] {
@@ -112,6 +118,35 @@ fn find_mca_files(dir: &Path, files: &mut Vec<(i32, i32, PathBuf)>) {
     }
 }
 
+fn get_block_at(section: &ParsedSection, x: usize, y: usize, z: usize) -> Block {
+    if section.palette.is_empty() {
+        return Block::Air;
+    }
+
+    let data = match section.data {
+        Some(d) => d,
+        None => return section.palette[0],
+    };
+
+    let bits_per_block = std::cmp::max(4, (section.palette.len() as f32).log2().ceil() as usize);
+    let blocks_per_entry = 64 / bits_per_block;
+    let block_index = (y * 256) + (z * 16) + x;
+    let entry_index = block_index / blocks_per_entry;
+    let bit_offset = (block_index % blocks_per_entry) * bits_per_block;
+    let mask = (1usize << bits_per_block) - 1;
+
+    if entry_index >= data.len() {
+        return Block::Air;
+    }
+
+    let palette_index = ((data[entry_index] as u64) >> bit_offset) as usize & mask;
+    section
+        .palette
+        .get(palette_index)
+        .copied()
+        .unwrap_or(Block::Air)
+}
+
 fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChunk> {
     let mut chunks = Vec::new();
     let mut file = match File::open(path) {
@@ -168,6 +203,28 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
                     if let Some(mut sections) = chunk.sections {
                         sections.sort_by(|a, b| b.y.cmp(&a.y));
 
+                        let parsed_sections: Vec<ParsedSection> = sections
+                            .iter()
+                            .map(|s| {
+                                let palette = s
+                                    .block_states
+                                    .as_ref()
+                                    .map(|bs| {
+                                        bs.palette
+                                            .iter()
+                                            .map(|b| parse_block_name(&b.name))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let data = s.block_states.as_ref().and_then(|bs| bs.data.as_ref());
+                                ParsedSection {
+                                    y: s.y,
+                                    palette,
+                                    data,
+                                }
+                            })
+                            .collect();
+
                         let mut colors = [[[30u8, 30, 30]; 16]; 16];
                         let mut world_heights = [[-64i16; 16]; 16];
                         let mut water_depths = [[0i16; 16]; 16];
@@ -178,20 +235,17 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
                                 let mut is_water = false;
                                 let mut depth = 0i16;
 
-                                'column: for section in &sections {
+                                'column: for section in &parsed_sections {
                                     for y_rel in (0..16).rev() {
-                                        let block_name = get_block_at(section, x, y_rel, z);
-                                        if block_name != "minecraft:air"
-                                            && block_name != "minecraft:cave_air"
-                                            && block_name != "minecraft:void_air"
-                                        {
+                                        let block = get_block_at(section, x, y_rel, z);
+                                        if block != Block::Air {
                                             if top_y.is_none() {
                                                 let world_y =
                                                     (section.y as i16 * 16) + y_rel as i16;
                                                 top_y = Some(world_y);
-                                                colors[z][x] = block_to_rgb(block_name);
-                                                if block_name == "minecraft:water"
-                                                    || block_name == "minecraft:bubble_column"
+                                                colors[z][x] = block_to_rgb(block);
+                                                if block == Block::Water
+                                                    || block == Block::BubbleColumn
                                                 {
                                                     is_water = true;
                                                 } else {
@@ -200,8 +254,8 @@ fn process_region(rx_coord: i32, rz_coord: i32, path: &Path) -> Vec<ProcessedChu
                                             }
 
                                             if is_water {
-                                                if block_name == "minecraft:water"
-                                                    || block_name == "minecraft:bubble_column"
+                                                if block == Block::Water
+                                                    || block == Block::BubbleColumn
                                                 {
                                                     depth += 1;
                                                 } else {
@@ -463,38 +517,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-fn get_block_at<'a>(section: &'a ChunkSection, x: usize, y: usize, z: usize) -> &'a str {
-    let block_states = match &section.block_states {
-        Some(bs) => bs,
-        None => return "minecraft:air",
-    };
-
-    let palette = &block_states.palette;
-    if palette.is_empty() {
-        return "minecraft:air";
-    }
-
-    let data = match &block_states.data {
-        Some(d) => d,
-        None => return &palette[0].name,
-    };
-
-    let bits_per_block = std::cmp::max(4, (palette.len() as f32).log2().ceil() as usize);
-    let blocks_per_entry = 64 / bits_per_block;
-    let block_index = (y * 256) + (z * 16) + x;
-    let entry_index = block_index / blocks_per_entry;
-    let bit_offset = (block_index % blocks_per_entry) * bits_per_block;
-    let mask = (1usize << bits_per_block) - 1;
-
-    if entry_index >= data.len() {
-        return "minecraft:air";
-    }
-
-    let palette_index = ((data[entry_index] as u64) >> bit_offset) as usize & mask;
-    palette
-        .get(palette_index)
-        .map(|b| b.name.as_str())
-        .unwrap_or("minecraft:air")
 }
