@@ -18,8 +18,6 @@ use tower_http::{
 mod block_to_rgb;
 use crate::block_to_rgb::{Block, block_to_rgb, parse_block_name};
 
-//lots of magic numbers here but they are here to convert minecraft region format (.mca). they are
-//bit lenght ecc.
 struct ProcessedChunk {
     reg_x: i32,
     reg_z: i32,
@@ -244,9 +242,7 @@ fn process_region(
 
                                 'column: for section in &parsed_sections {
                                     for y_rel in (0..16).rev() {
-                                        // Calculate the real Y coordinate first
                                         let world_y = (section.y as i16 * 16) + y_rel as i16;
-                                        // If we are in the Nether, slice off the roof (everything above Y=85)
                                         if is_nether && world_y > 85 {
                                             continue;
                                         }

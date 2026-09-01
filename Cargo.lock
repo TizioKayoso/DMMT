@@ -792,6 +792,7 @@ dependencies = [
  "phf",
  "rayon",
  "serde",
+ "serde_json",
  "tokio",
  "tower-http",
 ]
