@@ -2,6 +2,7 @@ use phf::phf_map;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+//i should have just parsed a json file
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Block {
     Air,
@@ -282,6 +283,10 @@ pub enum Block {
     SmallDripleaf,
     Anvil,
     BubbleColumn,
+    WaxedCopperGrate,
+    WaxedOxidizedCutCopperStairs,
+    WaxedCutCopperStairs,
+    infestedDeepslate,
     Unknown,
 }
 
@@ -1015,6 +1020,10 @@ static BLOCK_MAP: phf::Map<&'static str, Block> = phf_map! {
     "minecraft:infested_cobblestone" => Block::Cobblestone,
     "minecraft:copper_grate" => Block::CopperBlock,
     "minecraft:oxidized_copper_grate" => Block::CopperBlock,
+    "minecraft:waxed_copper_grate" => Block::WaxedCopperGrate,
+    "minecraft::waxed_oxidized_cut_copper_stairs" => Block::WaxedOxidizedCutCopperStairs,
+    "minecraft::waxed_cut_copper_stairs" => Block::WaxedCutCopperStairs,
+    "minecraft::infested_deepslate" => Block::infestedDeepslate,
 };
 
 static MISSING_BLOCKS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -1314,6 +1323,10 @@ pub fn block_to_rgb(block: Block) -> [u8; 3] {
         Block::SmallDripleaf => [80, 140, 50],
         Block::Anvil => [70, 70, 70],
         Block::BubbleColumn => [64, 64, 255],
+        Block::WaxedCopperGrate => [192, 106, 75],
+        Block::WaxedOxidizedCutCopperStairs => [72, 147, 139],
+        Block::WaxedCutCopperStairs => [192, 106, 75],
+        Block::infestedDeepslate => [100, 100, 100],
         Block::Unknown => [255, 0, 255],
     }
 }

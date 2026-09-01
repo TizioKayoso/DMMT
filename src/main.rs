@@ -18,6 +18,8 @@ use tower_http::{
 mod block_to_rgb;
 use crate::block_to_rgb::{Block, block_to_rgb, parse_block_name};
 
+//lots of magic numbers here but they are here to convert minecraft region format (.mca). they are
+//bit lenght ecc.
 struct ProcessedChunk {
     reg_x: i32,
     reg_z: i32,
