@@ -159,12 +159,12 @@ fn get_block_at(section: &ParsedSection, x: usize, y: usize, z: usize) -> Block 
         .unwrap_or(Block::Air)
 }
 
-fn process_region(
-    dim_name: &str,
-    dim_dir: &Path,
-    render_tx: &broadcast::Sender<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let start_time = Instant::now();
+fn process_region(rx: i32, rz: i32, path: &Path, is_nether: bool) -> Vec<ProcessedChunk> {
+    let mut chunks = Vec::new();
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return chunks,
+    };
     let mut header = [0u8; 4096];
     if file.read_exact(&mut header).is_err() {
         return chunks;
@@ -287,8 +287,8 @@ fn process_region(
                         }
 
                         chunks.push(ProcessedChunk {
-                            reg_x: rx_coord,
-                            reg_z: rz_coord,
+                            reg_x: rx,
+                            reg_z: rz,
                             cx,
                             cz,
                             colors,
@@ -372,7 +372,7 @@ fn generate_tile_pyramid(
                     .join(format!("{}.webp", tz));
                 tile.save(tile_path).unwrap();
                 let update_msg = format!(
-                    r#"{{\"dim\": \"overworld\", \"z\": {}, \"x\": {}, \"y\": {}}}"#,
+                    r#"{{"dim": "{}", "z": {}, "x": {}, "y": {}}}"#,
                     dim_name, zoom, tx, tz
                 );
                 let _ = render_tx.send(update_msg);
@@ -385,6 +385,7 @@ fn generate_tile_pyramid(
 fn process_dimension(
     dim_name: &str,
     dim_dir: &Path,
+    render_tx: &broadcast::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
     let mut region_files = Vec::new();
