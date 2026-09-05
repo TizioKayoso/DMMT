@@ -1,16 +1,25 @@
 use axum::{
     Router,
+    extract::State,
     http::{HeaderValue, header::CACHE_CONTROL},
+    response::sse::{Event, Sse},
+    routing::get,
 };
 use flate2::read::ZlibDecoder;
+use futures::stream::{Stream, StreamExt};
 use image::{Rgb, RgbImage};
 use rayon::prelude::*;
 use serde::Deserialize;
+use std::convert::Infallible;
+use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::{
     compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
 };
@@ -18,6 +27,9 @@ use tower_http::{
 mod block_to_rgb;
 use crate::block_to_rgb::{Block, block_to_rgb, parse_block_name};
 
+struct AppState {
+    tx: broadcast::Sender<String>,
+}
 struct ProcessedChunk {
     reg_x: i32,
     reg_z: i32,
@@ -31,7 +43,7 @@ struct ProcessedChunk {
 #[derive(Deserialize, Debug)]
 struct ChunkNBT {
     #[serde(rename = "DataVersion")]
-    data_version: i32,
+    _data_version: i32,
     sections: Option<Vec<ChunkSection>>,
 }
 
@@ -148,17 +160,11 @@ fn get_block_at(section: &ParsedSection, x: usize, y: usize, z: usize) -> Block 
 }
 
 fn process_region(
-    rx_coord: i32,
-    rz_coord: i32,
-    path: &Path,
-    is_nether: bool,
-) -> Vec<ProcessedChunk> {
-    let mut chunks = Vec::new();
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return chunks,
-    };
-
+    dim_name: &str,
+    dim_dir: &Path,
+    render_tx: &broadcast::Sender<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
     let mut header = [0u8; 4096];
     if file.read_exact(&mut header).is_err() {
         return chunks;
@@ -301,6 +307,8 @@ fn generate_tile_pyramid(
     img: &RgbImage,
     base_folder: &Path,
     max_zoom_out: i32,
+    render_tx: &broadcast::Sender<String>,
+    dim_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tile_size = 256u32;
 
@@ -361,8 +369,13 @@ fn generate_tile_pyramid(
             if !is_empty {
                 let tile_path = zoom_out_dir
                     .join(tx.to_string())
-                    .join(format!("{}.png", tz));
+                    .join(format!("{}.webp", tz));
                 tile.save(tile_path).unwrap();
+                let update_msg = format!(
+                    r#"{{\"dim\": \"overworld\", \"z\": {}, \"x\": {}, \"y\": {}}}"#,
+                    dim_name, zoom, tx, tz
+                );
+                let _ = render_tx.send(update_msg);
             }
         });
     }
@@ -492,14 +505,16 @@ fn process_dimension(
     let color_out = Path::new("tiles").join(dim_name);
     let height_out = Path::new("tiles_height").join(dim_name);
 
-    generate_tile_pyramid(&color_img, &color_out, -3)?;
-    generate_tile_pyramid(&height_img, &height_out, -3)?;
+    generate_tile_pyramid(&color_img, &color_out, -3, render_tx, dim_name)?;
+    generate_tile_pyramid(&height_img, &height_out, -3, render_tx, dim_name)?;
 
     println!("Finished '{}' in {:.2?}", dim_name, start_time.elapsed());
     Ok(())
 }
 
-fn run_generator() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn run_generator(
+    render_tx: &broadcast::Sender<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_dir = if Path::new("minecraft").exists() {
         Path::new("minecraft")
     } else if Path::new("region").exists() {
@@ -517,7 +532,7 @@ fn run_generator() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if dim_name == "creative_world" || dim_name.starts_with('.') {
                         continue;
                     }
-                    if let Err(e) = process_dimension(dim_name, &path) {
+                    if let Err(e) = process_dimension(dim_name, &path, render_tx) {
                         eprintln!("Error processing dimension '{}': {}", dim_name, e);
                     }
                 }
@@ -528,12 +543,40 @@ fn run_generator() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+async fn sse_handler(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|msg| async move {
+        match msg {
+            Ok(data) => Some(Ok(Event::default().data(data))),
+            Err(_) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let num_threads = env::var("MAX_THREADS")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse::<usize>()
+        .unwrap_or(0);
+    println!(
+        "Initialing thread pool with {} threads (0 = all avaiable cores)",
+        num_threads
+    );
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .unwrap();
+    let (tx, _rx) = broadcast::channel::<String>(100);
+    let app_state = Arc::new(AppState { tx: tx.clone() });
+    let render_tx = tx.clone();
     tokio::spawn(async move {
         loop {
             println!("Starting map generation cycle...");
-            if let Err(e) = run_generator() {
+            if let Err(e) = run_generator(&render_tx) {
                 eprintln!("Error during map generation: {}", e);
             }
             println!("Sleeping for 30 minutes...");
@@ -542,6 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let app = Router::new()
+        .route("/sse", get(sse_handler))
         .nest_service("/tiles", ServeDir::new("tiles"))
         .nest_service("/tiles_height", ServeDir::new("tiles_height"))
         .fallback_service(ServeDir::new("public"))
@@ -549,7 +593,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(SetResponseHeaderLayer::if_not_present(
             CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=604800"),
-        ));
+        ))
+        .with_state(app_state);
 
     println!("Starting web server on http://localhost:8080");
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
