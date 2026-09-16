@@ -9,7 +9,8 @@ use flate2::read::ZlibDecoder;
 use futures::stream::{Stream, StreamExt};
 use image::{Rgb, RgbImage};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::fs::File;
@@ -30,6 +31,7 @@ use crate::block_to_rgb::{Block, block_to_rgb, parse_block_name};
 struct AppState {
     tx: broadcast::Sender<String>,
 }
+
 struct ProcessedChunk {
     reg_x: i32,
     reg_z: i32,
@@ -70,6 +72,88 @@ struct ParsedSection<'a> {
     y: i8,
     palette: Vec<Block>,
     data: Option<&'a fastnbt::LongArray>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PlayerNbt {
+    #[serde(rename = "Pos")]
+    pos: Vec<f64>,
+    #[serde(rename = "Dimension")]
+    dimension: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct PlayerInfo {
+    pub uuid: String,
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub dimension: String,
+}
+
+#[derive(Deserialize)]
+struct UserCacheEntry {
+    name: String,
+    uuid: String,
+}
+
+fn load_user_cache(base_dir: &Path) -> HashMap<String, String> {
+    let cache_path = base_dir.join("usercache.json");
+    let mut cache = HashMap::new();
+    if let Ok(data) = std::fs::read_to_string(cache_path) {
+        if let Ok(entries) = serde_json::from_str::<Vec<UserCacheEntry>>(&data) {
+            for entry in entries {
+                cache.insert(entry.uuid, entry.name);
+            }
+        }
+    }
+    cache
+}
+
+fn get_active_players(base_dir: &Path) -> Vec<PlayerInfo> {
+    let mut players = Vec::new();
+    let playerdata_dir = base_dir.join("playerdata");
+    let user_cache = load_user_cache(base_dir);
+    if let Ok(entries) = std::fs::read_dir(playerdata_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("dat") {
+                let uuid = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Ok(file_bytes) = std::fs::read(&path) {
+                    let mut decoder = flate2::read::GzDecoder::new(&file_bytes[..]);
+                    let mut decompressed = Vec::new();
+                    if decoder.read_to_end(&mut decompressed).is_ok() {
+                        if let Ok(nbt) = fastnbt::from_bytes::<PlayerNbt>(&decompressed) {
+                            if nbt.pos.len() >= 3 {
+                                let name = user_cache
+                                    .get(&uuid)
+                                    .cloned()
+                                    .unwrap_or_else(|| uuid.clone());
+                                let raw_dim = nbt
+                                    .dimension
+                                    .unwrap_or_else(|| "minecraft:overworld".to_string());
+                                let dimension = raw_dim.replace("minecraft:", "");
+                                players.push(PlayerInfo {
+                                    uuid,
+                                    name,
+                                    x: nbt.pos[0],
+                                    y: nbt.pos[1],
+                                    z: nbt.pos[2],
+                                    dimension,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    players
 }
 
 fn depth_to_water_color(depth: i16) -> [u8; 3] {
@@ -372,7 +456,7 @@ fn generate_tile_pyramid(
                     .join(format!("{}.webp", tz));
                 tile.save(tile_path).unwrap();
                 let update_msg = format!(
-                    r#"{{"dim": "{}", "z": {}, "x": {}, "y": {}}}"#,
+                    r#"{{"type": "tile_update", "dim": "{}", "z": {}, "x": {}, "y": {}}}"#,
                     dim_name, zoom, tx, tz
                 );
                 let _ = render_tx.send(update_msg);
@@ -513,37 +597,6 @@ fn process_dimension(
     Ok(())
 }
 
-fn run_generator(
-    render_tx: &broadcast::Sender<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let base_dir = if Path::new("minecraft").exists() {
-        Path::new("minecraft")
-    } else if Path::new("region").exists() {
-        Path::new("region")
-    } else {
-        println!("Waiting for world directory ('minecraft' or 'region') to be mounted...");
-        return Ok(());
-    };
-
-    if let Ok(entries) = std::fs::read_dir(base_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(dim_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if dim_name == "creative_world" || dim_name.starts_with('.') {
-                        continue;
-                    }
-                    if let Err(e) = process_dimension(dim_name, &path, render_tx) {
-                        eprintln!("Error processing dimension '{}': {}", dim_name, e);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn sse_handler(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -564,24 +617,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<usize>()
         .unwrap_or(0);
     println!(
-        "Initialing thread pool with {} threads (0 = all avaiable cores)",
+        "Initializing thread pool with {} threads (0 = all available cores)",
         num_threads
     );
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global()
         .unwrap();
+
     let (tx, _rx) = broadcast::channel::<String>(100);
     let app_state = Arc::new(AppState { tx: tx.clone() });
     let render_tx = tx.clone();
+
     tokio::spawn(async move {
-        loop {
-            println!("Starting map generation cycle...");
-            if let Err(e) = run_generator(&render_tx) {
-                eprintln!("Error during map generation: {}", e);
+        let base_dir = Path::new("minecraft");
+
+        let player_tx = render_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let players = get_active_players(Path::new("minecraft"));
+                if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                    "type": "player_update",
+                    "players": players
+                })) {
+                    let _ = player_tx.send(json);
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            println!("Sleeping for 30 minutes...");
-            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        });
+
+        let mut last_modified: HashMap<PathBuf, std::time::SystemTime> = HashMap::new();
+        loop {
+            if base_dir.exists() {
+                let mut region_files = Vec::new();
+                find_mca_files(base_dir, &mut region_files);
+                for (rx, rz, path) in region_files {
+                    if let Ok(metadata) = std::fs::metadata(&path) {
+                        if let Ok(modified) = metadata.modified() {
+                            let is_new = last_modified
+                                .get(&path)
+                                .map_or(true, |&prev| modified > prev);
+                            if is_new {
+                                last_modified.insert(path.clone(), modified);
+                                let dim_name = path
+                                    .parent()
+                                    .and_then(|p| p.parent())
+                                    .and_then(|p| p.file_name())
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("overworld");
+                                println!(
+                                    "Live update detected in region r.{}.{}.mca ({})",
+                                    rx, rz, dim_name
+                                );
+                                let _ =
+                                    process_dimension(dim_name, path.parent().unwrap(), &render_tx);
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
