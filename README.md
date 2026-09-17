@@ -37,12 +37,3 @@ DMMT is meant to be a performance focused alternative to other mapping tools, of
   - **Server-Sent Events (SSE):** Event stream subscription for real-time tile cache-busting and marker updates[cite: 3].
 
 ---
-
-## Repository Structure
-
-```text
-.
-├── block_to_rgb.rs    # Block classification, RGB mapping, and blocks.json parser
-├── main.rs            # Axum server, MCA region processor, tile generator & file watcher
-├── index.html         # Leaflet UI frontend with live SSE listeners[cite: 3]
-└── blocks.json        # (Optional) Mapping of Minecraft block identifiers to RGB tuples[cite: 1]
