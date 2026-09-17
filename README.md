@@ -5,6 +5,7 @@
 > This repository is currently in early development. Features, internal APIs, and configurations may undergo significant changes as development progresses.
 
 **Dynamic Minecraft Mapping Tool (DMMT)** is a real-time, high-performance web-based map renderer for Minecraft worlds written in Rust and HTML/JavaScript. It parses Minecraft Anvil region files (`.mca`) directly from a server world directory, renders tile pyramids as `.webp` images, tracks player locations, and streams real-time updates to an interactive Leaflet frontend using Server-Sent Events (SSE).
+DMMT is meant to be a performance focused alternative to other mapping tools, offering low options in exchange.
 
 ---
 
