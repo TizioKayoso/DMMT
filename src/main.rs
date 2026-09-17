@@ -651,6 +651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if base_dir.exists() {
                 let mut region_files = Vec::new();
                 find_mca_files(base_dir, &mut region_files);
+                let mut dims_to_update = std::collections::HashMap::new();
                 for (rx, rz, path) in region_files {
                     if let Ok(metadata) = std::fs::metadata(&path) {
                         if let Ok(modified) = metadata.modified() {
@@ -669,11 +670,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "Live update detected in region r.{}.{}.mca ({})",
                                     rx, rz, dim_name
                                 );
-                                let _ =
-                                    process_dimension(dim_name, path.parent().unwrap(), &render_tx);
+                                dims_to_update.insert(
+                                    dim_name.to_string(),
+                                    path.parent().unwrap().to_path_buf(),
+                                );
                             }
                         }
                     }
+                }
+                for (dim_name, dim_dir) in dims_to_update {
+                    let _ = process_dimension(&dim_name, &dim_dir, &render_tx);
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -688,7 +694,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(CompressionLayer::new())
         .layer(SetResponseHeaderLayer::if_not_present(
             CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=604800"),
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         ))
         .with_state(app_state);
 

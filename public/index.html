@@ -53,7 +53,7 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     let currentDimension = 'overworld';
-
+    let playerMarkers = {};
     const commonLayerOptions = {
       tileSize: 256,
       noWrap: true,
@@ -136,7 +136,7 @@
           updatePlayerMarkers(data.players);
         }
       };
-      document.getEgetElementById('dimSelect').addEventListener('change', (e) => {
+      document.getElementById('dimSelect').addEventListener('change', (e) => {
         currentDimension = e.target.value;
         colorMap.setUrl(`/tiles/${currentDimension}/{z}/{x}/{y}.webp`);
         heightMap.setUrl(`/tiles_height/${currentDimension}/{z}/{x}/{y}.webp`);
@@ -161,29 +161,16 @@
     });
 
     map.addControl(new DimensionControl());
-
+    evt.Source.onerror = function (err) {
+      console.error("SSE connection lost. Reconnecting automatically...", err);
+    };
     document.getElementById('dimSelect').addEventListener('change', (e) => {
       currentDimension = e.target.value;
       colorMap.setUrl(`/tiles/${currentDimension}/{z}/{x}/{y}.webp`);
       heightMap.setUrl(`/tiles_height/${currentDimension}/{z}/{x}/{y}.webp`);
+      playerLayerGroup.clearLayers();
+      playerMarkers = {};
     });
-    const evtSource = new EventSource("/sse");
-
-    evtSource.onmessage = function (event) {
-      const data = JSON.parse(event.data);
-      if (data.dim !== currentDimension) return;
-      const tileBaseUrl = `/tiles/${data.dim}/${data.z}/${data.x}/${data.y}.webp`;
-      const heightBaseUrl = `/tiles_height/${data.dim}/${data.z}/${data.x}/${data.y}.webp`;
-      const tileImages = document.querySelectorAll(`img[src^="${tileBaseUrl}"], img[src^="${heightBaseUrl}"]`);
-      const timestamp = new Date().getTime();
-      tileImages.forEach(img => {
-        const baseSrc = img.src.split('?')[0];
-        img.src = `${baseSrc}?t=${timestamp}`;
-      });
-    };
-    evt.Source.onerror = function (err) {
-      console.error("SSE connection lost. Reconnecting automatically...", err);
-    };
   </script>
 </body>
 
