@@ -1,36 +1,18 @@
-use axum::{
-    Router,
-    extract::State,
-    http::{HeaderValue, header::CACHE_CONTROL},
-    response::sse::{Event, Sse},
-    routing::get,
-};
 use flate2::read::ZlibDecoder;
-use futures::stream::{Stream, StreamExt};
 use image::{Rgb, RgbImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
-use tower_http::{
-    compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
-};
 
 mod block_to_rgb;
+mod server;
 use crate::block_to_rgb::{Block, block_to_rgb, parse_block_name};
-
-struct AppState {
-    tx: broadcast::Sender<String>,
-}
 
 struct ProcessedChunk {
     reg_x: i32,
@@ -597,19 +579,6 @@ fn process_dimension(
     Ok(())
 }
 
-async fn sse_handler(
-    State(state): State<Arc<AppState>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| async move {
-        match msg {
-            Ok(data) => Some(Ok(Event::default().data(data))),
-            Err(_) => None,
-        }
-    });
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_threads = env::var("MAX_THREADS")
@@ -626,7 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
 
     let (tx, _rx) = broadcast::channel::<String>(100);
-    let app_state = Arc::new(AppState { tx: tx.clone() });
+
     let render_tx = tx.clone();
 
     tokio::spawn(async move {
@@ -686,20 +655,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = Router::new()
-        .route("/sse", get(sse_handler))
-        .nest_service("/tiles", ServeDir::new("tiles"))
-        .nest_service("/tiles_height", ServeDir::new("tiles_height"))
-        .fallback_service(ServeDir::new("public"))
-        .layer(CompressionLayer::new())
-        .layer(SetResponseHeaderLayer::if_not_present(
-            CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-        ))
-        .with_state(app_state);
-
-    println!("Starting web server on http://localhost:8080");
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    axum::serve(listener, app).await?;
+    server::serve(8080, tx).await?;
     Ok(())
 }
